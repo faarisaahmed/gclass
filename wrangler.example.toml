@@ -1,0 +1,16 @@
+# Template used by `npm run setup`, which copies it to wrangler.toml with your values filled in.
+# wrangler.toml is personal (it has your storage ID), so it's ignored by git.
+
+name = "__NAME__"
+main = "src/index.js"
+compatibility_date = "2025-01-01"
+
+[vars]
+# Timezone used to show due dates.
+TIMEZONE = "__TIMEZONE__"
+
+[[kv_namespaces]]
+binding = "KV"
+id = "__KV_ID__"
+
+# Secret, set by setup:  ACCESS_KEY (the password for your site)

@@ -1,0 +1,34 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+  body { width: 300px; font: 13px system-ui, -apple-system, "Segoe UI", sans-serif; margin: 14px; color: #1d2330; }
+  h1 { font-size: 15px; margin: 0 0 12px; }
+  label { display: block; margin: 10px 0 3px; color: #555; }
+  .hint { font-size: 11px; color: #888; margin-top: 3px; }
+  input { width: 100%; box-sizing: border-box; padding: 7px 9px; border: 1px solid #ccc; border-radius: 7px; font: inherit; }
+  input:focus { outline: none; border-color: #376a5f; box-shadow: 0 0 0 3px #e3eeeb; }
+  button { margin-top: 10px; width: 100%; padding: 9px; border: 0; border-radius: 7px; background: #376a5f; color: #fff; font: inherit; font-weight: 600; cursor: pointer; }
+  button.secondary { background: #ececea; color: #1d2330; }
+  #status { margin-top: 10px; font-size: 12px; }
+  .ok { color: #1f7a4c; } .bad { color: #c2410c; }
+  a { color: #376a5f; }
+</style>
+</head>
+<body>
+  <h1>Classroom To-do Sync</h1>
+  <label for="workerUrl">Site URL</label>
+  <input id="workerUrl" placeholder="https://gclass.yourname.workers.dev">
+  <label for="accessKey">Access key</label>
+  <input id="accessKey" type="password">
+  <label for="email">School Google email (optional)</label>
+  <input id="email" type="email" placeholder="you@school.org">
+  <div class="hint">Only needed if this Chrome is signed in to more than one Google account.</div>
+  <button id="save" class="secondary">Save</button>
+  <button id="sync">Sync now</button>
+  <div id="status"></div>
+  <p><a id="open" href="#" target="_blank">Open my assignments page</a></p>
+  <script src="popup.js"></script>
+</body>
+</html>

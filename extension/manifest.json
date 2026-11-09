@@ -1,0 +1,17 @@
+{
+  "manifest_version": 3,
+  "name": "Classroom To-do Sync",
+  "version": "1.0.0",
+  "description": "Scrapes your Google Classroom To-do list and sends it to your Cloudflare Worker.",
+  "permissions": ["storage", "alarms"],
+  "host_permissions": ["https://classroom.google.com/*", "https://*.workers.dev/*"],
+  "background": { "service_worker": "background.js" },
+  "content_scripts": [
+    {
+      "matches": ["https://classroom.google.com/*"],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ],
+  "action": { "default_popup": "popup.html", "default_title": "Classroom To-do Sync" }
+}

@@ -1,0 +1,10 @@
+node_modules/
+.wrangler/
+.DS_Store
+
+# Personal: created by `npm run setup`. Contain your access key or account IDs.
+wrangler.toml
+.setup.json
+MY-SITE.txt
+ACCESS_KEY.txt
+extension/config.js
