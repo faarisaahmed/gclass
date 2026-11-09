@@ -6,11 +6,12 @@ main = "src/index.js"
 compatibility_date = "2025-01-01"
 
 [vars]
-# Timezone used to show due dates.
+# Your name (shown on the People page), and the timezone used to show due dates.
+OWNER_NAME = "__OWNER_NAME__"
 TIMEZONE = "__TIMEZONE__"
 
 [[kv_namespaces]]
 binding = "KV"
 id = "__KV_ID__"
 
-# Secret, set by setup:  ACCESS_KEY (the password for your site)
+# Secret, set by setup:  ACCESS_KEY (the owner's key; it also opens the /admin People page)

@@ -3,6 +3,8 @@
 
 // config.js is written by `npm run setup` (it holds your Worker URL, key and email) and is never
 // committed to git. Without it, you fill those in from the extension popup instead.
+// The shared site everyone uses. People hosting their own copy can change it in the popup.
+const DEFAULT_URL = "https://gclass.helloimthesigma.workers.dev";
 self.GCLASS_CONFIG = {};
 try { importScripts("config.js"); } catch {}
 const LISTS = [
@@ -42,7 +44,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
 async function settings() {
   const s = await chrome.storage.sync.get(["workerUrl", "accessKey", "email"]);
   const c = self.GCLASS_CONFIG || {};
-  const workerUrl = s.workerUrl || c.workerUrl || "";
+  const workerUrl = s.workerUrl || c.workerUrl || DEFAULT_URL;
   return { workerUrl: workerUrl.replace(/\/+$/, ""), accessKey: s.accessKey || c.accessKey || "", email: s.email || c.email || "" };
 }
 
@@ -52,13 +54,14 @@ async function setStatus(text, ok) {
 
 async function post(path, body) {
   const { workerUrl, accessKey } = await settings();
-  if (!workerUrl || !accessKey) throw new Error("Fill in the Site URL and access key in this popup, then Save.");
+  if (!accessKey) throw new Error("Paste your key in this popup and click Save first.");
   const res = await fetch(`${workerUrl}${path}`, {
     method: "POST",
     headers: { "Content-Type": "application/json", Authorization: `Bearer ${accessKey}` },
     body: JSON.stringify(body),
   });
-  if (!res.ok) throw new Error(`Worker said ${res.status}: ${(await res.text()).slice(0, 200)}`);
+  if (res.status === 401) throw new Error("The site didn't accept your key. Check it in this popup.");
+  if (!res.ok) throw new Error(`The site said ${res.status}: ${(await res.text()).slice(0, 200)}`);
 }
 
 async function withAccount(url) {

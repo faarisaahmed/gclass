@@ -1,8 +1,23 @@
-// Cloudflare Worker that shows your Google Classroom assignments.
-// It never talks to Google: the Chrome extension in ../extension scrapes Classroom in your
-// browser and POSTs the results here. Everything is stored in one KV namespace.
+// Cloudflare Worker that shows Google Classroom assignments for several people.
+// It never talks to Google: the Chrome extension in ../extension scrapes Classroom in each
+// person's own browser and POSTs the results here.
+//
+// People: the owner logs in with the ACCESS_KEY secret and manages everyone else at /admin.
+// Each person gets their own random key; only a SHA-256 hash of it is stored.
+//
+// KV layout:
+//   users                  -> [{ id, name, keyHash, created }]   (list for the admin page)
+//   user:<keyHash>         -> { id, name }                        (key lookup)
+//   u:<id>:assigned        -> { scrapedAt, items }                (To-do list)
+//   u:<id>:details         -> { <link>: { description, attachments, work, ... } }
+//   u:<id>:hidden          -> [link, ...]
+//   u:<id>:debug:<name>    -> page outline for fixing the scraper (7-day expiry)
 
 const COOKIE_TTL = 60 * 60 * 24 * 90; // stay logged in for 90 days
+const OWNER = "owner";
+// The free plan allows ~1,000 KV writes a day for everyone together, so unchanged data is
+// only rewritten (to refresh "Synced … ago") at most once an hour.
+const REFRESH_MS = 60 * 60 * 1000;
 
 export default {
   async fetch(request, env) {
@@ -17,9 +32,12 @@ export default {
         case "GET /api/debug": return await getDebug(request, url, env);
         case "POST /api/hide": return await hide(request, env);
         case "GET /api/assignments": return await apiAll(request, env);
+        case "GET /api/me": return await apiMe(request, env);
         case "POST /login": return await login(request, env);
         case "GET /logout": return logout();
         case "GET /": return await home(request, env);
+        case "GET /admin": return await adminPage(request, env);
+        case "POST /admin": return await adminAction(request, env);
       }
       return new Response("Not found", { status: 404 });
     } catch (err) {
@@ -29,25 +47,43 @@ export default {
   },
 };
 
-// ---------------------------------------------------------------- auth
+// ---------------------------------------------------------------- people & auth
 
 async function sha256(s) {
   const buf = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(s));
   return [...new Uint8Array(buf)].map((b) => b.toString(16).padStart(2, "0")).join("");
 }
 
-const isExtension = (request, env) => request.headers.get("Authorization") === `Bearer ${env.ACCESS_KEY}`;
+const newKey = () => {
+  const b = new Uint8Array(15);
+  crypto.getRandomValues(b);
+  return btoa(String.fromCharCode(...b)).replace(/\+/g, "x").replace(/\//g, "y").replace(/=+$/, "");
+};
+const newId = () => [...crypto.getRandomValues(new Uint8Array(6))].map((b) => b.toString(16).padStart(2, "0")).join("");
 
-async function isAuthed(request, env) {
-  return isExtension(request, env) || getCookie(request, "auth") === (await sha256(env.ACCESS_KEY));
+// Look a person up by the hash of their key.
+async function userByHash(hash, env) {
+  if (!hash) return null;
+  if (hash === (await sha256(env.ACCESS_KEY))) return { id: OWNER, name: env.OWNER_NAME || "Owner", admin: true };
+  const u = await env.KV.get(`user:${hash}`, "json");
+  return u ? { ...u, admin: false } : null;
+}
+
+// From the extension (Authorization: Bearer <key>) or the website (cookie holding the key's hash).
+async function currentUser(request, env) {
+  const h = request.headers.get("Authorization") || "";
+  if (h.startsWith("Bearer ")) return userByHash(await sha256(h.slice(7).trim()), env);
+  return userByHash(getCookie(request, "auth"), env);
 }
 
 async function login(request, env) {
   const form = await request.formData();
-  if (form.get("key") !== env.ACCESS_KEY) return html(loginPage("That key didn't work. Try again."), 401);
+  const key = String(form.get("key") || "").trim();
+  const hash = await sha256(key);
+  if (!key || !(await userByHash(hash, env))) return html(loginPage("That key didn't work. Check it and try again."), 401);
   return new Response(null, {
     status: 303,
-    headers: { Location: "/", "Set-Cookie": `auth=${await sha256(env.ACCESS_KEY)}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=${COOKIE_TTL}` },
+    headers: { Location: "/", "Set-Cookie": `auth=${hash}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=${COOKIE_TTL}` },
   });
 }
 
@@ -60,6 +96,7 @@ function logout() {
 const str = (v, n) => String(v ?? "").slice(0, n);
 const httpUrl = (u) => (/^https?:\/\//i.test(u || "") ? str(u, 2000) : "");
 const classroomUrl = (u) => (/^https:\/\/classroom\.google\.com\//.test(u || "") ? str(u, 500) : "");
+const k = (user, name) => `u:${user.id}:${name}`;
 
 function cleanAttachments(list) {
   return (Array.isArray(list) ? list : []).slice(0, 30).map((a) => ({
@@ -67,10 +104,12 @@ function cleanAttachments(list) {
   })).filter((a) => a.url);
 }
 
+const unauthorized = () => json({ error: "Unknown key. Check the key in the extension popup." }, 401);
+
 async function ingest(request, env) {
-  if (!isExtension(request, env)) return json({ error: "bad key" }, 401);
+  const user = await currentUser(request, env);
+  if (!user) return unauthorized();
   const body = await request.json();
-  const status = body.status === "missing" ? "missing" : "assigned";
   if (!Array.isArray(body.items)) return json({ error: "items must be an array" }, 400);
   const items = body.items.slice(0, 500).map((i) => ({
     title: str(i.title, 300),
@@ -82,19 +121,24 @@ async function ingest(request, env) {
     link: classroomUrl(i.link),
     lines: Array.isArray(i.lines) ? i.lines.slice(0, 10).map((l) => str(l, 200)) : [],
   }));
-  await env.KV.put(`snap:${status}`, JSON.stringify({ scrapedAt: new Date().toISOString(), items }));
+
+  const prev = await env.KV.get(k(user, "assigned"), "json");
+  const same = prev && JSON.stringify(prev.items) === JSON.stringify(items);
+  if (same && Date.now() - Date.parse(prev.scrapedAt) < REFRESH_MS) return json({ ok: true, count: items.length, unchanged: true });
+  await env.KV.put(k(user, "assigned"), JSON.stringify({ scrapedAt: new Date().toISOString(), items }));
   return json({ ok: true, count: items.length });
 }
 
 async function ingestDetails(request, env) {
-  if (!isExtension(request, env)) return json({ error: "bad key" }, 401);
+  const user = await currentUser(request, env);
+  if (!user) return unauthorized();
   const body = await request.json();
-  const details = (await env.KV.get("details", "json")) || {};
+  const details = (await env.KV.get(k(user, "details"), "json")) || {};
+  let changed = false;
   for (const d of (body.items || []).slice(0, 100)) {
     const link = classroomUrl(d.link);
     if (!link) continue;
-    details[link] = {
-      fetchedAt: new Date().toISOString(),
+    const entry = {
       title: str(d.title, 300),
       teacher: str(d.teacher, 100),
       dueText: str(d.dueText, 100),
@@ -103,58 +147,137 @@ async function ingestDetails(request, env) {
       attachments: cleanAttachments(d.attachments),
       work: d.work ? { status: str(d.work.status, 40), attachments: cleanAttachments(d.work.attachments) } : null,
     };
+    const old = details[link];
+    const { fetchedAt, ...oldContent } = old || {};
+    // Rewrite only if something changed, or to keep it from expiring below.
+    if (!old || JSON.stringify(oldContent) !== JSON.stringify(entry) || Date.now() - Date.parse(fetchedAt) > 7 * 86400e3) {
+      details[link] = { fetchedAt: new Date().toISOString(), ...entry };
+      changed = true;
+    }
   }
   // Forget details for assignments not seen in 60 days so the blob stays small.
   const cutoff = Date.now() - 60 * 86400e3;
-  for (const [k, v] of Object.entries(details)) if (Date.parse(v.fetchedAt) < cutoff) delete details[k];
-  await env.KV.put("details", JSON.stringify(details));
-  return json({ ok: true });
+  for (const [key, v] of Object.entries(details)) if (Date.parse(v.fetchedAt) < cutoff) { delete details[key]; changed = true; }
+  if (changed) await env.KV.put(k(user, "details"), JSON.stringify(details));
+  return json({ ok: true, changed });
 }
 
 async function saveDebug(request, env) {
-  if (!isExtension(request, env)) return json({ error: "bad key" }, 401);
+  const user = await currentUser(request, env);
+  if (!user) return unauthorized();
   const { name, text } = await request.json();
   if (!/^[\w-]{1,40}$/.test(name || "")) return json({ error: "bad name" }, 400);
-  await env.KV.put(`debug:${name}`, str(text, 1_000_000), { expirationTtl: 7 * 86400 });
+  await env.KV.put(k(user, `debug:${name}`), str(text, 1_000_000), { expirationTtl: 7 * 86400 });
   return json({ ok: true });
 }
 
 async function getDebug(request, url, env) {
-  if (!(await isAuthed(request, env))) return json({ error: "not logged in" }, 401);
-  const name = url.searchParams.get("name") || "";
-  const text = await env.KV.get(`debug:${name}`);
+  const user = await currentUser(request, env);
+  if (!user) return unauthorized();
+  // The owner can read anyone's outline (?user=<id>) to fix the scraper for them.
+  const id = user.admin && url.searchParams.get("user") ? url.searchParams.get("user") : user.id;
+  const text = await env.KV.get(`u:${id}:debug:${url.searchParams.get("name") || ""}`);
   return new Response(text ?? "none", { headers: { "Content-Type": "text/plain; charset=utf-8" } });
 }
 
 async function hide(request, env) {
-  if (!(await isAuthed(request, env))) return json({ error: "not logged in" }, 401);
+  const user = await currentUser(request, env);
+  if (!user) return json({ error: "not logged in" }, 401);
   const { link, hidden } = await request.json();
   if (!classroomUrl(link)) return json({ error: "bad link" }, 400);
-  const set = new Set((await env.KV.get("hidden", "json")) || []);
+  const set = new Set((await env.KV.get(k(user, "hidden"), "json")) || []);
   hidden ? set.add(link) : set.delete(link);
-  await env.KV.put("hidden", JSON.stringify([...set]));
+  await env.KV.put(k(user, "hidden"), JSON.stringify([...set]));
   return json({ ok: true });
 }
 
-async function loadAll(env) {
+async function loadAll(user, env) {
   const [assigned, details, hidden] = await Promise.all([
-    env.KV.get("snap:assigned", "json"),
-    env.KV.get("details", "json"),
-    env.KV.get("hidden", "json"),
+    env.KV.get(k(user, "assigned"), "json"),
+    env.KV.get(k(user, "details"), "json"),
+    env.KV.get(k(user, "hidden"), "json"),
   ]);
   return { assigned, details: details || {}, hidden: hidden || [] };
 }
 
 async function apiAll(request, env) {
-  if (!(await isAuthed(request, env))) return json({ error: "not logged in" }, 401);
-  return json(await loadAll(env));
+  const user = await currentUser(request, env);
+  if (!user) return json({ error: "not logged in" }, 401);
+  return json(await loadAll(user, env));
+}
+
+// The extension calls this to check a key and greet the person by name.
+async function apiMe(request, env) {
+  const user = await currentUser(request, env);
+  if (!user) return unauthorized();
+  return json({ name: user.name });
 }
 
 async function home(request, env) {
-  if (!(await isAuthed(request, env))) return html(loginPage());
-  const data = await loadAll(env);
+  const user = await currentUser(request, env);
+  if (!user) return html(loginPage());
+  const data = await loadAll(user, env);
   data.tz = env.TIMEZONE || "America/New_York";
+  data.name = user.name;
+  data.admin = user.admin;
   return html(appPage(data));
+}
+
+// ---------------------------------------------------------------- admin
+
+async function listUsers(env) {
+  return (await env.KV.get("users", "json")) || [];
+}
+
+async function adminPage(request, env, flash = null) {
+  const user = await currentUser(request, env);
+  if (!user) return html(loginPage());
+  if (!user.admin) return new Response("Only the site owner can open this page.", { status: 403 });
+
+  const users = [{ id: OWNER, name: `${user.name} (you)`, owner: true }, ...(await listUsers(env))];
+  const snaps = await Promise.all(users.map((u) => env.KV.get(`u:${u.id}:assigned`, "json")));
+  const origin = new URL(request.url).origin;
+  return html(adminHtml(users, snaps, flash, origin));
+}
+
+async function adminAction(request, env) {
+  const user = await currentUser(request, env);
+  if (!user?.admin) return new Response("Only the site owner can do this.", { status: 403 });
+  const form = await request.formData();
+  const action = form.get("action");
+  const users = await listUsers(env);
+
+  if (action === "add") {
+    const name = str(form.get("name"), 60).trim();
+    if (!name) return adminPage(request, env, { error: "Type a name first." });
+    const key = newKey();
+    const keyHash = await sha256(key);
+    const u = { id: newId(), name, keyHash, created: new Date().toISOString() };
+    await env.KV.put(`user:${keyHash}`, JSON.stringify({ id: u.id, name }));
+    await env.KV.put("users", JSON.stringify([...users, u]));
+    return adminPage(request, env, { name, key });
+  }
+
+  const u = users.find((x) => x.id === form.get("id"));
+  if (!u) return adminPage(request, env, { error: "That person wasn't found." });
+
+  if (action === "reset") {
+    const key = newKey();
+    const keyHash = await sha256(key);
+    await env.KV.delete(`user:${u.keyHash}`);
+    await env.KV.put(`user:${keyHash}`, JSON.stringify({ id: u.id, name: u.name }));
+    u.keyHash = keyHash;
+    await env.KV.put("users", JSON.stringify(users));
+    return adminPage(request, env, { name: u.name, key, reset: true });
+  }
+
+  if (action === "remove") {
+    await env.KV.delete(`user:${u.keyHash}`);
+    await Promise.all(["assigned", "details", "hidden"].map((n) => env.KV.delete(`u:${u.id}:${n}`)));
+    await env.KV.put("users", JSON.stringify(users.filter((x) => x.id !== u.id)));
+    return adminPage(request, env, { removed: u.name });
+  }
+  return adminPage(request, env, { error: "Unknown action." });
 }
 
 // ---------------------------------------------------------------- helpers
@@ -231,11 +354,78 @@ function loginPage(msg = "") {
   </style></head><body><div class="login"><form class="box" method="post" action="/login">
     <div class="mark"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12.5l4.5 4.5L19 7.5"/></svg></div>
     <h1>Assignments</h1>
-    <p>Enter your access key to continue.</p>
+    <p>Enter your key to see your assignments.</p>
     ${msg ? `<div class="err">${esc(msg)}</div>` : ""}
-    <input type="password" name="key" placeholder="Access key" autocomplete="current-password" autofocus required>
+    <input type="password" name="key" placeholder="Your key" autocomplete="current-password" autofocus required>
     <button class="go" type="submit">Continue</button>
   </form></div></body></html>`;
+}
+
+function adminHtml(users, snaps, flash, origin) {
+  const ago = (iso) => {
+    if (!iso) return "Never synced";
+    const m = Math.round((Date.now() - Date.parse(iso)) / 6e4);
+    if (m < 60) return `Synced ${m < 1 ? "just now" : m + " min ago"}`;
+    const h = Math.round(m / 60);
+    return `Synced ${h < 48 ? h + " hr" : Math.round(h / 24) + " days"} ago`;
+  };
+  const invite = flash?.key ? `Here's your key for the Google Classroom assignments site: ${flash.key}
+
+1. Download the extension: https://github.com/faarisaahmed/gclass (green Code button > Download ZIP, then unzip it)
+2. In Chrome go to chrome://extensions, turn on Developer mode, click Load unpacked, and pick the "extension" folder
+3. Click the extension icon, paste your key, click Save, then Sync now
+4. See your assignments at ${origin}` : "";
+
+  let banner = "";
+  if (flash?.error) banner = `<div class="flash err">${esc(flash.error)}</div>`;
+  else if (flash?.removed) banner = `<div class="flash">Removed ${esc(flash.removed)}.</div>`;
+  else if (flash?.key) banner = `<div class="flash ok">
+      <b>${flash.reset ? "New key for" : "Added"} ${esc(flash.name)}.</b> Send them this message. The key is only shown once.
+      <textarea id="inv" readonly rows="8">${esc(invite)}</textarea>
+      <button class="go" type="button" onclick="navigator.clipboard.writeText(document.getElementById('inv').value).then(()=>this.textContent='Copied')">Copy message</button>
+    </div>`;
+
+  const rows = users.map((u, i) => `
+    <div class="urow">
+      <div class="who"><b>${esc(u.name)}</b><span>${esc(ago(snaps[i]?.scrapedAt))}${snaps[i] ? ` &middot; ${snaps[i].items.length} assignments` : ""}</span></div>
+      ${u.owner ? '<span class="tag">Owner</span>' : `
+      <form method="post"><input type="hidden" name="action" value="reset"><input type="hidden" name="id" value="${esc(u.id)}">
+        <button class="small" onclick="return confirm('Make a new key for ${esc(u.name).replace(/'/g, "")}? Their old key stops working.')">New key</button></form>
+      <form method="post"><input type="hidden" name="action" value="remove"><input type="hidden" name="id" value="${esc(u.id)}">
+        <button class="small danger" onclick="return confirm('Remove ${esc(u.name).replace(/'/g, "")} and delete their data?')">Remove</button></form>`}
+    </div>`).join("");
+
+  return `<!doctype html><html lang="en"><head>${HEAD}<style>${CSS}
+  .top { display:flex; justify-content:space-between; align-items:center; margin-bottom:24px; }
+  h1 { font-size:26px; letter-spacing:-.02em; margin:0; }
+  .back { font-size:14px; color:var(--text-2); text-decoration:none; padding:7px 12px; border:1px solid var(--line); border-radius:9px; background:var(--surface); }
+  .card { background:var(--surface); border:1px solid var(--line); border-radius:14px; box-shadow:var(--shadow); margin-bottom:18px; }
+  .pad { padding:18px; }
+  h2 { font-size:13px; font-weight:600; color:var(--text-2); margin:0 0 10px 2px; }
+  .add { display:flex; gap:8px; }
+  input[type=text] { flex:1; min-width:0; font:inherit; padding:10px 12px; border-radius:10px; border:1px solid var(--line-2); background:var(--bg); color:var(--text); outline:none; }
+  input[type=text]:focus { border-color:var(--accent); box-shadow:0 0 0 3px var(--accent-soft); }
+  .go { background:var(--accent); color:var(--accent-text); font-weight:600; padding:10px 16px; border-radius:10px; }
+  .urow { display:flex; align-items:center; gap:8px; padding:13px 16px; }
+  .urow + .urow { border-top:1px solid var(--line); }
+  .who { flex:1; min-width:0; } .who b { display:block; font-weight:600; } .who span { font-size:13px; color:var(--text-3); }
+  .small { font-size:13px; padding:6px 10px; border-radius:8px; border:1px solid var(--line); color:var(--text-2); }
+  .small:hover { background:var(--surface-2); } .danger { color:var(--red); }
+  .tag { font-size:12px; color:var(--text-3); padding:4px 9px; border-radius:999px; background:var(--surface-2); }
+  .flash { padding:14px 16px; border-radius:12px; margin-bottom:18px; background:var(--surface-2); font-size:14px; }
+  .flash.ok { background:var(--accent-soft); } .flash.err { background:var(--red-soft); color:var(--red); }
+  .flash textarea { display:block; width:100%; margin:10px 0; font:13px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; padding:10px; border-radius:9px; border:1px solid var(--line-2); background:var(--surface); color:var(--text); resize:vertical; }
+  .note { font-size:13px; color:var(--text-3); margin:6px 2px 0; }
+  </style></head><body><div class="wrap">
+    <div class="top"><h1>People</h1><a class="back" href="/">Back to assignments</a></div>
+    ${banner}
+    <h2>Add someone</h2>
+    <form class="card pad add" method="post"><input type="hidden" name="action" value="add">
+      <input type="text" name="name" placeholder="Their name" maxlength="60" required><button class="go">Create key</button></form>
+    <h2>Everyone (${users.length})</h2>
+    <div class="card">${rows}</div>
+    <p class="note">Each person only sees their own assignments. You can't see theirs here, only when they last synced.</p>
+  </div></body></html>`;
 }
 
 function appPage(data) {
@@ -245,10 +435,10 @@ function appPage(data) {
 <div class="wrap">
   <header class="top">
     <div>
-      <h1>Assignments</h1>
+      <h1>${data.name && !data.admin ? esc(data.name.split(" ")[0]) + "'s assignments" : "Assignments"}</h1>
       <div class="sync" id="sync"></div>
     </div>
-    <a class="ghost" href="/logout">Log out</a>
+    <div class="acts">${data.admin ? '<a class="ghost" href="/admin">People</a>' : ""}<a class="ghost" href="/logout">Log out</a></div>
   </header>
   <nav class="tabs" id="tabs" role="tablist">
     <button role="tab" data-tab="upcoming">Upcoming <span class="n"></span></button>
@@ -277,6 +467,7 @@ const APP_CSS = `
 .dot.stale { background:var(--amber); }
 .ghost { font-size:13px; color:var(--text-2); text-decoration:none; padding:7px 12px; border-radius:9px; border:1px solid var(--line); background:var(--surface); }
 .ghost:hover { border-color:var(--line-2); }
+.acts { display:flex; gap:8px; }
 
 .tabs { display:flex; gap:4px; padding:4px; background:var(--surface-2); border-radius:12px; width:fit-content; margin-bottom:16px; }
 .tabs button { padding:7px 14px; border-radius:9px; font-size:14px; font-weight:500; color:var(--text-2); display:flex; align-items:center; gap:7px; }

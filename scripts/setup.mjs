@@ -85,10 +85,11 @@ async function main() {
     console.log(red("Use only lowercase letters, numbers and dashes."));
     if (yes) fail("Invalid site name in .setup.json.");
   }
+  const ownerName = await ask("Your first name (shown on the People page)", state.ownerName || "Owner");
   const email = await ask("Your school Google email (optional, helps if Chrome has several Google accounts)", state.email || "");
   const timezone = await ask("Your timezone", state.timezone || Intl.DateTimeFormat().resolvedOptions().timeZone || "America/New_York");
   rl.close();
-  Object.assign(state, { name, email, timezone });
+  Object.assign(state, { name, ownerName, email, timezone });
   save();
 
   // 4. storage (KV namespace)
@@ -109,7 +110,7 @@ async function main() {
   console.log(green("Storage ready."));
 
   const toml = fs.readFileSync(path.join(root, "wrangler.example.toml"), "utf8")
-    .replace("__NAME__", name).replace("__KV_ID__", state.kvId).replace("__TIMEZONE__", timezone);
+    .replace("__NAME__", name).replace("__KV_ID__", state.kvId).replace("__TIMEZONE__", timezone).replace("__OWNER_NAME__", ownerName.replace(/["\\]/g, ""));
   fs.writeFileSync(path.join(root, "wrangler.toml"), toml);
 
   // 5. deploy + access key
@@ -139,12 +140,12 @@ async function main() {
   fs.writeFileSync(path.join(root, "extension", "config.js"),
     `// Written by npm run setup. Contains your access key, so don't share or commit this file.\nself.GCLASS_CONFIG = ${JSON.stringify(config, null, 2)};\n`);
   fs.writeFileSync(path.join(root, "MY-SITE.txt"),
-    `Your assignments site\n\nSite URL:   ${url}\nAccess key: ${state.accessKey}\n\nKeep the access key private. Anyone with it can see your assignments.\n`);
+    `Your assignments site\n\nSite URL:   ${url}\nOwner key:  ${state.accessKey}\nPeople:     ${url}/admin (add friends and get keys for them)\n\nKeep the owner key private. It can see your assignments and manage everyone's keys.\n`);
   console.log(green("Done."));
 
   console.log(`
 ${bold("Your site:")}   ${url}
-${bold("Access key:")}  ${state.accessKey}
+${bold("Owner key:")}   ${state.accessKey}   (log in with this; add friends under People, at ${url}/admin)
 (Both are also saved in MY-SITE.txt in this folder.)
 
 ${bold("Next:")} load the extension in Chrome (README, step 4):
